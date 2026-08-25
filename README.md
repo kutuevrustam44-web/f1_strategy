@@ -12,5 +12,5 @@ Ensure you have Python 3.9+ installed, then run the following commands in your t
 pip install streamlit pandas plotly
 python -m streamlit run app.py
 ```
-DON`T FORGER UPLOAD ALL LIBRARY
+DON`T FORGET UPLOAD ALL LIBRARY
 ---
