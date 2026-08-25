@@ -17,7 +17,7 @@ import streamlit as st
 PIRELLI_COLORS = {
     "Soft": "#E60000",
     "Medium": "#FCD700",
-    "Hard": "#FFFFFF",
+    "Hard": "#808080",
     "Intermediate": "#39B54A",
     "Wet": "#0072CE",
 }
@@ -66,6 +66,10 @@ SLICK_WET_WEAR_MULTIPLIER = 5.0
 SLICK_DAMP_WEAR_MULTIPLIER = 2.0
 
 WING_REPAIR_PENALTY = 10.0
+
+# Dirty air (running in another car's turbulent wake) increases tyre
+# wear on top of the fixed pace penalty already modelled per lap.
+DIRTY_AIR_WEAR_MULTIPLIER = 1.15
 
 
 # =============================================================================
@@ -292,6 +296,9 @@ class TyrePhysics:
             elif self.weather == "Damp":
                 base *= SLICK_DAMP_WEAR_MULTIPLIER
 
+        if self.dirty_air:
+            base *= DIRTY_AIR_WEAR_MULTIPLIER
+
         return float(base)
 
     def _temperature_time_delta(self) -> float:
@@ -461,6 +468,7 @@ class CarState:
     penalty_served: bool = False
 
     force_wing_replacement_next_pit: bool = False
+    race_started: bool = False
 
     @property
     def remaining_laps(self) -> int:
@@ -550,192 +558,199 @@ def weather_for_simulation_lap(
     )
 
 
-def preferred_emergency_compound(
-    inventory: Dict[str, List[Dict[str, Any]]],
-    weather: str,
-) -> Optional[str]:
-
-    if weather == "Wet":
-        order = ("Wet", "Intermediate", "Hard", "Medium", "Soft")
-
-    elif weather == "Damp":
-        order = (
-            "Intermediate",
-            "Wet",
-            "Medium",
-            "Hard",
-            "Soft",
-        )
-
-    else:
-        order = (
-            "Medium",
-            "Hard",
-            "Soft",
-            "Intermediate",
-            "Wet",
-        )
-
-    for compound in order:
-        if inventory.get(compound):
-            return compound
-
-    return None
-
-
 # =============================================================================
 # GLOBAL STRATEGY OPTIMIZER
 # =============================================================================
 
 class StrategyOptimizer:
     """
-    Brute-force strategy evaluation from the current simulation state.
+    Multi-stop brute-force strategy evaluation from the current race state.
 
-    Optimization preserves live-state synchronization:
-    - current race lap;
-    - active tyre set;
-    - current tyre wear state.
+    A plan is represented as:
+    [(pit_lap_1, compound_1), (pit_lap_2, compound_2), ...]
 
-    Each simulation starts from the appropriate live state.
+    Monaco and Monza are limited to 0-stop and 1-stop plans. All other
+    circuits evaluate 0 to 3 stops with a mandatory six-lap separation.
     """
 
-    LAP_STEP = 3
+    LAP_STEP = 5
     TOP_N = 5
+    MIN_STOP_GAP = 6
+    MAX_STOPS = 3
 
-    def __init__(
-        self,
-        car: CarState,
-        lap_step: int = 3,
-    ):
+    def __init__(self, car: CarState, lap_step: int = 5):
         self.car = car
-        self.lap_step = max(2, int(lap_step))
+        self.lap_step = max(1, int(lap_step))
 
-    def _fresh_inventory(
-        self,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        return copy.deepcopy(
-            self.car.tyre_sets_inventory
-        )
-
-    def _starting_candidates(
-        self,
-        inventory: Dict[str, List[Dict[str, Any]]],
-    ) -> List[str]:
-        return [
-            compound
-            for compound in ALL_COMPOUNDS
-            if inventory.get(compound)
-        ]
-
-    def _is_legal_two_stint_plan(
-        self,
-        start_comp: str,
-        second_comp: str,
-        inventory: Dict[str, List[Dict[str, Any]]],
-    ) -> bool:
-
-        if start_comp == second_comp:
-            return False
-
-        required = {
-            compound: 0
-            for compound in ALL_COMPOUNDS
-        }
-
-        required[start_comp] += 1
-        required[second_comp] += 1
-
-        return all(
-            len(inventory.get(compound, []))
-            >= required[compound]
-            for compound in ALL_COMPOUNDS
-        )
+    def _fresh_inventory(self) -> Dict[str, List[Dict[str, Any]]]:
+        return copy.deepcopy(self.car.tyre_sets_inventory)
 
     def _consume_set(
         self,
         inventory: Dict[str, List[Dict[str, Any]]],
         compound: str,
     ) -> Optional[Dict[str, Any]]:
-
         if not inventory.get(compound):
             return None
-
         return inventory[compound].pop(0)
+
+    def _max_stops(self) -> int:
+        if self.car.track.name in ("Monaco", "Monza"):
+            return 1
+        return self.MAX_STOPS
+
+    def _weather_at_lap(self, lap: int) -> str:
+        track = self.car.track
+        elapsed = float(max(0, lap - 1)) * float(track.base_lap_time)
+        return self.car.weather_radar.weather_for_lap(
+            lap=int(lap),
+            race_elapsed_seconds=elapsed,
+            base_lap_time=float(track.base_lap_time),
+        )
+
+    def _track_condition_changed(self, lap_a: int, lap_b: int) -> bool:
+        """True if the forecast track condition differs between two laps."""
+        return self._weather_at_lap(lap_a) != self._weather_at_lap(lap_b)
+
+    def _pit_lap_candidates(self) -> List[int]:
+        start_lap = max(1, int(self.car.lap))
+        finish = int(self.car.track.total_laps)
+        first = start_lap + 1
+        if first >= finish:
+            return []
+        return list(range(first, finish, self.lap_step))
+
+    def _generate_plans(self) -> List[List[Tuple[int, str]]]:
+        """
+        Generate legal pit-stop strategies with a bounded iterative search.
+
+        The search space is intentionally restricted to:
+        - 0-stop strategies
+        - 1-stop strategies
+        - 2-stop strategies
+
+        Every pair of consecutive pit stops must have a minimum six-lap gap.
+        Monaco and Monza are restricted to 0-stop and 1-stop strategies only.
+        """
+        pit_laps = self._pit_lap_candidates()
+        max_stops = min(2, self._max_stops())
+        compounds = tuple(ALL_COMPOUNDS)
+        plans: List[List[Tuple[int, str]]] = [[]]
+
+        # One-stop layer.
+        if max_stops >= 1:
+            for lap_1 in pit_laps:
+                for comp_1 in compounds:
+                    plans.append([(int(lap_1), str(comp_1))])
+
+        # Two-stop layer.
+        if max_stops >= 2:
+            for index_1, lap_1 in enumerate(pit_laps):
+                for lap_2 in pit_laps[index_1 + 1:]:
+                    if int(lap_2) - int(lap_1) < self.MIN_STOP_GAP:
+                        continue
+
+                    for comp_1 in compounds:
+                        for comp_2 in compounds:
+                            if (
+                                comp_1 == comp_2
+                                and not self._track_condition_changed(
+                                    int(lap_1),
+                                    int(lap_2),
+                                )
+                            ):
+                                continue
+
+                            plans.append(
+                                [
+                                    (int(lap_1), str(comp_1)),
+                                    (int(lap_2), str(comp_2)),
+                                ]
+                            )
+
+        return plans
 
     def _simulate_strategy(
         self,
         start_comp: str,
-        pit_lap: Optional[int],
-        second_comp: Optional[str],
+        plan: List[Tuple[int, str]],
     ) -> Optional[Dict[str, Any]]:
+        """
+        Simulate the complete remaining race for a multi-stop plan.
 
+        Planned stops are executed sequentially. A sporting penalty is served
+        on the first available in-lap using a strict hands-off procedure:
+        penalty seconds are added, tyre and wing service are deferred, and the
+        penalty is then cleared.
+        """
         track = self.car.track
         total_laps = int(track.total_laps)
-
+        start_lap = max(1, int(self.car.lap))
         inventory = self._fresh_inventory()
 
-        live_start = int(self.car.lap) > 1
+        live_start = int(self.car.lap) > 1 or bool(
+            getattr(self.car, "race_started", False)
+        )
 
         if live_start:
             if str(self.car.current_tyre.composition) != str(start_comp):
                 return None
-
             start_set = {
                 "id": "LIVE_CURRENT_SET",
                 "health": float(self.car.current_tyre.health),
                 "age": int(self.car.current_tyre.age),
             }
         else:
-            start_set = self._consume_set(
-                inventory,
-                start_comp,
-            )
-
+            start_set = self._consume_set(inventory, str(start_comp))
             if start_set is None:
                 return None
 
-        if pit_lap is not None:
-            if second_comp is None:
-                return None
-
-            if start_comp == second_comp:
-                return None
-
-            if not inventory.get(second_comp):
-                return None
-
         tyre = TyrePhysics(
-            composition=start_comp,
+            composition=str(start_comp),
             health=float(start_set["health"]),
             age=int(start_set["age"]),
             base_lap_time=float(track.base_lap_time),
             tyre_stress=float(track.tyre_stress),
             weather="Dry",
-            track_temperature=float(
-                self.car.track_temperature
-            ),
+            track_temperature=float(self.car.track_temperature),
         )
+
+        plan = [(int(lap), str(comp)) for lap, comp in plan]
+        plan.sort(key=lambda item: item[0])
+
+        if len({lap for lap, _ in plan}) != len(plan):
+            return None
+
+        for index in range(1, len(plan)):
+            if plan[index][0] - plan[index - 1][0] < self.MIN_STOP_GAP:
+                return None
+
+        if any(
+            lap < start_lap or lap >= total_laps
+            for lap, _ in plan
+        ):
+            return None
 
         total_time = 0.0
         lap_history: List[Dict[str, Any]] = []
+        transitions = [{
+            "lap": int(start_lap),
+            "composition": str(start_comp),
+            "note": "Active tyre set" if live_start else "Starting tyre set",
+        }]
 
-        transitions = [
-            {
-                "lap": int(self.car.lap) if live_start else 1,
-                "composition": start_comp,
-                "note": "Active tyre set" if live_start else "Starting tyre set",
-            }
-        ]
-
-        out_lap_next = False
-        current_comp = start_comp
+        current_comp = str(start_comp)
         current_health = float(start_set["health"])
         current_age = int(start_set["age"])
+        out_lap_next = False
+        plan_index = 0
 
-        start_lap = max(1, int(self.car.lap))
+        penalty = float(self.car.time_penalty)
+        penalty_served = bool(self.car.penalty_served) or penalty <= 0.0
+        wing_damage = str(self.car.wing_damage)
+        force_wing = bool(self.car.force_wing_replacement_next_pit)
 
         for lap in range(start_lap, total_laps + 1):
-
             weather = weather_for_simulation_lap(
                 radar=self.car.weather_radar,
                 lap=lap,
@@ -743,26 +758,27 @@ class StrategyOptimizer:
                 track=track,
             )
 
-            is_in_lap = (
-                pit_lap is not None
-                and lap == int(pit_lap)
+            scheduled_stop = (
+                plan_index < len(plan)
+                and lap == int(plan[plan_index][0])
             )
 
             tyre = TyrePhysics(
-                composition=current_comp,
+                composition=str(current_comp),
                 health=float(current_health),
                 age=int(current_age),
                 base_lap_time=float(track.base_lap_time),
                 tyre_stress=float(track.tyre_stress),
-                weather=weather,
-                track_temperature=float(
-                    self.car.track_temperature
-                ),
+                weather=str(weather),
+                dirty_air=bool(self.car.dirty_air),
+                wing_damage=str(wing_damage),
+                track_temperature=float(self.car.track_temperature),
                 PIT_OUT_LAP=bool(out_lap_next),
             )
 
             out_lap_next = False
-
+            was_out_lap = bool(tyre.PIT_OUT_LAP)
+            health_before = float(tyre.health)
             lap_time = tyre.compute_lap_time(
                 evolution_at(lap, total_laps)
             )
@@ -770,152 +786,146 @@ class StrategyOptimizer:
             if lap == 1 and not live_start:
                 lap_time += 3.0
 
-            if is_in_lap:
+            wing_repair = False
+            penalty_served_this_lap = False
+            fitted_compound: Optional[str] = None
+
+            if scheduled_stop:
                 lap_time += float(track.pit_loss)
 
-            health_before = float(tyre.health)
+                if not penalty_served and penalty > 0.0:
+                    lap_time += float(penalty)
+                    penalty = 0.0
+                    penalty_served = True
+                    penalty_served_this_lap = True
+                    transitions.append({
+                        "lap": int(lap),
+                        "composition": str(current_comp),
+                        "note": "Penalty service: hands-off",
+                    })
+                else:
+                    if wing_damage in ("Minor", "Critical") or force_wing:
+                        lap_time += WING_REPAIR_PENALTY
+                        wing_damage = "None"
+                        force_wing = False
+                        wing_repair = True
 
             tyre.apply_lap()
 
-            lap_history.append(
-                {
-                    "lap": int(lap),
-                    "time": float(lap_time),
-                    "health_before": float(
-                        health_before
-                    ),
-                    "health_after": float(
-                        tyre.health
-                    ),
-                    "composition": str(
-                        current_comp
-                    ),
-                    "weather": str(weather),
-                    "is_in_lap": bool(is_in_lap),
-                    "is_out_lap": bool(
-                        tyre.PIT_OUT_LAP
-                    ),
-                }
-            )
+            lap_history.append({
+                "lap": int(lap),
+                "time": float(lap_time),
+                "health_before": float(health_before),
+                "health_after": float(tyre.health),
+                "composition": str(current_comp),
+                "weather": str(weather),
+                "is_in_lap": bool(scheduled_stop),
+                "is_out_lap": bool(was_out_lap),
+                "wing_repair": bool(wing_repair),
+                "penalty_served": bool(penalty_served_this_lap),
+            })
 
             total_time += float(lap_time)
-
             current_health = float(tyre.health)
             current_age = int(tyre.age)
 
-            if is_in_lap:
-                next_set = self._consume_set(
-                    inventory,
-                    str(second_comp),
-                )
+            if scheduled_stop:
+                planned_compound = str(plan[plan_index][1])
+                plan_index += 1
 
-                if next_set is None:
-                    return None
+                if not penalty_served_this_lap:
+                    next_set = self._consume_set(
+                        inventory,
+                        planned_compound,
+                    )
+                    if next_set is None:
+                        return None
 
-                current_comp = str(second_comp)
-                current_health = float(
-                    next_set["health"]
-                )
-                current_age = int(next_set["age"])
-                out_lap_next = True
+                    current_comp = planned_compound
+                    current_health = float(next_set["health"])
+                    current_age = int(next_set["age"])
+                    out_lap_next = True
+                    fitted_compound = planned_compound
 
-                transitions.append(
-                    {
+                    transitions.append({
                         "lap": int(lap),
-                        "composition": str(
-                            second_comp
-                        ),
+                        "composition": str(planned_compound),
                         "note": "Pit stop",
-                    }
-                )
+                    })
+
+                else:
+                    transitions.append({
+                        "lap": int(lap),
+                        "composition": str(planned_compound),
+                        "note": "Tyre service deferred after penalty",
+                    })
+
+        if plan_index != len(plan):
+            return None
 
         return {
             "total_time": float(total_time),
             "start_compound": str(start_comp),
-            "pit_lap": (
-                int(pit_lap)
-                if pit_lap is not None
-                else None
-            ),
+            "plan": plan,
+            "pit_lap": int(plan[0][0]) if plan else None,
+            "second_compound": str(plan[0][1]) if plan else None,
             "start_lap": int(start_lap),
-            "second_compound": second_comp,
             "transitions": transitions,
             "lap_history": lap_history,
         }
 
+    def _dry_race_requires_two_slick_sets(self, result: Dict[str, Any]) -> bool:
+        """For fully dry races, only show strategies using two different slick compounds."""
+        for lap in range(1, int(self.car.track.total_laps) + 1):
+            if self._weather_at_lap(lap) != "Dry":
+                return False
+
+        compounds = [str(result.get("start_compound", ""))]
+        compounds.extend(str(compound) for _, compound in result.get("plan", []))
+        slicks = [compound for compound in compounds if compound in SLICK_COMPOUNDS]
+        return len(set(slicks)) >= 2
+
     def optimize(self) -> List[Dict[str, Any]]:
-        """
-        Brute-force enumeration from the current race state.
-
-        Evaluation scope:
-        1. All legal starting compounds or the active live compound.
-        2. No-stop continuation.
-        3. Each possible future pit lap using the configured step.
-        4. All legal second-stint compounds.
-        5. Physical tyre allocation validation.
-        """
-
         inventory = self._fresh_inventory()
-
         results: List[Dict[str, Any]] = []
 
-        if int(self.car.lap) > 1:
+        live_start = int(self.car.lap) > 1 or bool(
+            getattr(self.car, "race_started", False)
+        )
+
+        if live_start:
             start_candidates = [str(self.car.current_tyre.composition)]
         else:
-            start_candidates = self._starting_candidates(inventory)
+            start_candidates = [
+                compound for compound in ALL_COMPOUNDS
+                if inventory.get(compound)
+            ]
 
-        possible_pit_laps = list(
-            range(
-                int(self.car.lap) + 1,
-                int(self.car.track.total_laps),
-                self.lap_step,
-            )
-        )
+        plans = self._generate_plans()
 
         for start_comp in start_candidates:
+            for plan in plans:
+                result = self._simulate_strategy(
+                    start_comp=str(start_comp),
+                    plan=list(plan),
+                )
+                if result is not None:
+                    results.append(result)
 
-            no_stop = self._simulate_strategy(
-                start_comp=start_comp,
-                pit_lap=None,
-                second_comp=None,
-            )
+        results.sort(key=lambda item: float(item["total_time"]))
 
-            if no_stop is not None:
-                results.append(no_stop)
-
-            for pit_lap in possible_pit_laps:
-
-                for second_comp in ALL_COMPOUNDS:
-
-                    if int(self.car.lap) > 1:
-                        if (
-                            second_comp == start_comp
-                            or not inventory.get(second_comp)
-                        ):
-                            continue
-                    elif not self._is_legal_two_stint_plan(
-                        start_comp=start_comp,
-                        second_comp=second_comp,
-                        inventory=inventory,
-                    ):
-                        continue
-
-                    result = self._simulate_strategy(
-                        start_comp=start_comp,
-                        pit_lap=int(pit_lap),
-                        second_comp=second_comp,
-                    )
-
-                    if result is not None:
-                        results.append(result)
-
-        results.sort(
-            key=lambda item: float(
-                item["total_time"]
-            )
-        )
+        if all(
+            self._weather_at_lap(lap) == "Dry"
+            for lap in range(1, int(self.car.track.total_laps) + 1)
+        ):
+            results = [
+                item for item in results
+                if self._dry_race_requires_two_slick_sets(item)
+            ]
 
         return results[: self.TOP_N]
+
+
 
 
 # =============================================================================
@@ -936,29 +946,20 @@ def _drive_one_lap(car: CarState) -> str:
     car.current_tyre.wing_damage = car.wing_damage
     car.current_tyre.dirty_air = car.dirty_air
 
-    # Emergency pit stop when the active tyre set reaches failure.
+    # Critical tyre life warning. The system no longer auto-selects or
+    # reserves a tyre set from the warehouse inventory on the engineer's
+    # behalf. The car remains on track on the degraded set until the
+    # strategy engineer manually selects a tyre set and confirms the
+    # box call via the "BOX, BOX" control.
     if (
         car.current_tyre.is_break()
         and not car.pending_pit
     ):
-        emergency_comp = preferred_emergency_compound(
-            car.tyre_sets_inventory,
-            weather,
+        messages.append(
+            "CRITICAL TYRE LIFE WARNING: Active compound health dropped "
+            "below 15%! Schedule an urgent box window manually via Pit "
+            "Wall Center to avoid catastrophic failure."
         )
-
-        if emergency_comp is not None:
-            car.pending_pit = True
-            car.pending_set_id = (
-                car.tyre_sets_inventory[
-                    emergency_comp
-                ][0]["id"]
-            )
-
-            messages.append(
-                "Emergency pit stop: "
-                f"tyre life "
-                f"{car.current_tyre.health:.1f}%."
-            )
 
     is_in_lap = bool(car.pending_pit)
 
@@ -1222,6 +1223,8 @@ def _init_state() -> None:
         "weather_start_seconds": 999999.0,
         "weather_duration_laps": 0,
         "weather_intensity": "Wet",
+        "baseline_initial_time": None,
+        "dirty_air": False,
     }
 
     for key, value in defaults.items():
@@ -1247,6 +1250,7 @@ def _build_car(
     weather_radar: WeatherRadar,
     track_temperature: float,
     time_penalty: float,
+    dirty_air: bool = False,
 ) -> Optional[CarState]:
     """Build the live car from the exact tyre set selected in the allocation inventory."""
 
@@ -1286,6 +1290,7 @@ def _build_car(
         base_lap_time=float(track.base_lap_time),
         tyre_stress=float(track.tyre_stress),
         weather=first_weather,
+        dirty_air=bool(dirty_air),
         track_temperature=float(track_temperature),
     )
 
@@ -1297,6 +1302,7 @@ def _build_car(
         weather_radar=weather_radar,
         track_temperature=float(track_temperature),
         time_penalty=float(time_penalty),
+        dirty_air=bool(dirty_air),
     )
 
 
@@ -1308,6 +1314,7 @@ def _build_preview_car(
         str,
         List[Dict[str, Any]],
     ],
+    dirty_air: bool = False,
 ) -> CarState:
     """
     Builds a temporary car object for the pre-race
@@ -1329,6 +1336,7 @@ def _build_preview_car(
         base_lap_time=track.base_lap_time,
         tyre_stress=track.tyre_stress,
         weather="Dry",
+        dirty_air=bool(dirty_air),
         track_temperature=track_temperature,
     )
 
@@ -1339,6 +1347,7 @@ def _build_preview_car(
         tyre_sets_inventory=inventory_copy,
         weather_radar=weather_radar,
         track_temperature=track_temperature,
+        dirty_air=bool(dirty_air),
     )
 
 
@@ -1387,6 +1396,7 @@ def _render_prerace_briefing(
         tyre_sets_inventory=(
             st.session_state.tyre_sets_inventory
         ),
+        dirty_air=bool(config.get("dirty_air", False)),
     )
 
     optimizer = StrategyOptimizer(
@@ -1428,8 +1438,7 @@ def _render_prerace_briefing(
 
     baseline = optimizer._simulate_strategy(
         start_comp=config["start_comp"],
-        pit_lap=None,
-        second_comp=None,
+        plan=[],
     )
 
     if baseline is not None:
@@ -1441,9 +1450,8 @@ def _render_prerace_briefing(
         delta = baseline_time - best_time
 
         selected_matches_best = (
-            best["start_compound"]
-            == config["start_comp"]
-            and best["pit_lap"] is None
+            best["start_compound"] == config["start_comp"]
+            and not best.get("plan")
         )
 
         if delta > 0.05 and not selected_matches_best:
@@ -1617,8 +1625,8 @@ class Dashboard:
                 y=times,
                 mode="lines+markers",
                 line=dict(
-                    color="#B0B0B0",
-                    width=1.5,
+                    color="#808080",
+                    width=3,
                 ),
                 marker=dict(
                     color=colors,
@@ -1655,8 +1663,8 @@ class Dashboard:
                 y=healths,
                 mode="lines+markers",
                 line=dict(
-                    color="#B0B0B0",
-                    width=1.5,
+                    color="#808080",
+                    width=3,
                 ),
                 marker=dict(
                     color=colors,
@@ -1793,23 +1801,25 @@ class Dashboard:
         strategy: Dict[str, Any],
         total_laps: int,
     ) -> str:
+        start = str(strategy["start_compound"])
+        plan = [
+            (int(lap), str(compound))
+            for lap, compound in strategy.get("plan", [])
+        ]
 
-        start = strategy["start_compound"]
-
-        pit_lap = strategy["pit_lap"]
-        second = strategy["second_compound"]
-
-        if pit_lap is None:
+        if not plan:
             return (
-                f"Start: {start} | "
-                f"No Pit Stop | "
-                f"Finish: Lap {total_laps}"
+                f"Start: {start} | No Pit Stop | "
+                f"Finish: Lap {int(total_laps)}"
             )
 
+        stops = " | ".join(
+            f"Pit {lap}: {compound}"
+            for lap, compound in plan
+        )
         return (
-            f"Start: {start} | "
-            f"Pit: Lap {pit_lap} -> {second} | "
-            f"Finish: Lap {total_laps}"
+            f"Start: {start} | {stops} | "
+            f"Finish: Lap {int(total_laps)}"
         )
 
     @staticmethod
@@ -1817,103 +1827,71 @@ class Dashboard:
         lap_history: List[Dict[str, Any]],
         key: str,
     ) -> None:
-
         if not lap_history:
             return
 
-        laps = [
-            int(item["lap"])
-            for item in lap_history
-        ]
-
-        times = [
-            float(item["time"])
-            for item in lap_history
-        ]
-
-        healths = [
-            float(item["health_after"])
-            for item in lap_history
-        ]
-
-        comps = [
-            str(item["composition"])
-            for item in lap_history
-        ]
-
-        colors = [
-            PIRELLI_COLORS[item]
-            for item in comps
-        ]
+        laps = [int(item["lap"]) for item in lap_history]
+        times = [float(item["time"]) for item in lap_history]
+        healths = [float(item["health_after"]) for item in lap_history]
+        comps = [str(item["composition"]) for item in lap_history]
 
         fig = make_subplots(
             rows=2,
             cols=1,
             shared_xaxes=True,
             vertical_spacing=0.10,
-            subplot_titles=(
-                "Predicted Lap Time",
-                "Predicted Tyre Life",
-            ),
+            subplot_titles=("Predicted Lap Time", "Predicted Tyre Life"),
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=laps,
-                y=times,
-                mode="lines+markers",
-                line=dict(
-                    color="#B0B0B0",
-                    width=1.5,
-                ),
-                marker=dict(
-                    color=colors,
-                    size=8,
-                    line=dict(
-                        color="#000000",
-                        width=1,
-                    ),
-                ),
-                text=comps,
-                hovertemplate=(
-                    "Lap %{x}<br>"
-                    "Race Time: %{y:.3f} sec<br>"
-                    "Compound: %{text}"
-                    "<extra></extra>"
-                ),
-            ),
-            row=1,
-            col=1,
-        )
+        # One trace per contiguous stint keeps each Pirelli colour continuous.
+        start_index = 0
+        while start_index < len(laps):
+            compound = comps[start_index]
+            end_index = start_index + 1
+            while end_index < len(laps) and comps[end_index] == compound:
+                end_index += 1
 
-        fig.add_trace(
-            go.Scatter(
-                x=laps,
-                y=healths,
-                mode="lines+markers",
-                line=dict(
-                    color="#B0B0B0",
-                    width=1.5,
-                ),
-                marker=dict(
-                    color=colors,
-                    size=8,
-                    line=dict(
-                        color="#000000",
-                        width=1,
+            segment_laps = laps[start_index:end_index]
+            segment_times = times[start_index:end_index]
+            segment_healths = healths[start_index:end_index]
+            colour = PIRELLI_COLORS[compound]
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[int(value) for value in segment_laps],
+                    y=[float(value) for value in segment_times],
+                    mode="lines+markers",
+                    line=dict(color=colour, width=2.5),
+                    marker=dict(color=colour, size=7),
+                    text=[str(compound)] * len(segment_laps),
+                    hovertemplate=(
+                        "Lap %{x}<br>Race Time: %{y:.3f} sec<br>"
+                        "Compound: %{text}<extra></extra>"
                     ),
+                    showlegend=False,
                 ),
-                text=comps,
-                hovertemplate=(
-                    "Lap %{x}<br>"
-                    "Tyre Life (%): %{y:.1f}%<br>"
-                    "Compound: %{text}"
-                    "<extra></extra>"
+                row=1,
+                col=1,
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[int(value) for value in segment_laps],
+                    y=[float(value) for value in segment_healths],
+                    mode="lines+markers",
+                    line=dict(color=colour, width=2.5),
+                    marker=dict(color=colour, size=7),
+                    text=[str(compound)] * len(segment_laps),
+                    hovertemplate=(
+                        "Lap %{x}<br>Tyre Life: %{y:.1f}%<br>"
+                        "Compound: %{text}<extra></extra>"
+                    ),
+                    showlegend=False,
                 ),
-            ),
-            row=2,
-            col=1,
-        )
+                row=2,
+                col=1,
+            )
+            start_index = end_index
 
         fig.update_xaxes(
             type="linear",
@@ -1922,107 +1900,105 @@ class Dashboard:
             row=2,
             col=1,
         )
-
+        fig.update_yaxes(type="linear", tickformat=".2f", row=1, col=1)
         fig.update_yaxes(
             type="linear",
-            tickformat=".2f",
-            row=1,
-            col=1,
-        )
-
-        fig.update_yaxes(
-            type="linear",
-            range=[0, 105],
+            range=[0.0, 105.0],
             tickformat=".1f",
             row=2,
             col=1,
         )
-
         fig.update_layout(
             template="plotly_dark",
             height=480,
             showlegend=False,
+            margin=dict(l=60, r=30, t=70, b=50),
         )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            key=key,
-        )
+        st.plotly_chart(fig, use_container_width=True, key=key)
 
     @staticmethod
-    def render_strategy_cards(
-        car: CarState,
-    ) -> None:
+    def render_strategy_cards(car: CarState) -> None:
+        st.markdown("### Global Strategy Brute-Force: TOP-5 Permutations")
 
-        st.markdown(
-            "### Global Strategy Brute-Force: TOP-5 Permutations"
-        )
-
-        optimizer = StrategyOptimizer(
-            car=car,
-            lap_step=3,
-        )
-
-        strategies = optimizer.optimize()
+        strategies = StrategyOptimizer(car=car, lap_step=5).optimize()
 
         if not strategies:
-            st.warning(
-                "No legal strategies were found."
-            )
+            st.warning("No legal strategies were found.")
             return
 
-        best_time = float(
-            strategies[0]["total_time"]
-        )
+        baseline = st.session_state.get("baseline_initial_time")
+        best_time = float(strategies[0]["total_time"])
 
-        for index, strategy in enumerate(
-            strategies,
-            start=1,
-        ):
-            total_time = float(
-                strategy["total_time"]
+        for index, strategy in enumerate(strategies, start=1):
+            total_time = float(strategy["total_time"])
+            delta_to_best = total_time - best_time
+            chain = Dashboard.format_strategy_chain(
+                strategy,
+                car.track.total_laps,
             )
 
-            delta = total_time - best_time
+            # Live progression-aware delta: the optimizer's "total_time"
+            # field is the remaining projected time from the current lap
+            # onward, not the full race total. To compare cleanly against
+            # the Lap 0 baseline (a full-race projection) the elapsed race
+            # time already banked in car.total_time must be added back in
+            # before differencing against the baseline.
+            if baseline is None:
+                evolution_text = "Baseline pending"
+                evolution_color = "#FFFFFF"
+            else:
+                evolution = (
+                    float(car.total_time) + total_time
+                ) - float(baseline)
 
-            chain = (
-                Dashboard.format_strategy_chain(
-                    strategy,
-                    car.track.total_laps,
-                )
-            )
+                if evolution < -0.0005:
+                    evolution_text = (
+                        f"Faster by {evolution:.3f} sec "
+                        "versus opening baseline"
+                    )
+                    evolution_color = PIRELLI_COLORS["Intermediate"]
+                elif evolution > 0.0005:
+                    evolution_text = (
+                        f"Pace loss delta: +{evolution:.3f} sec "
+                        "slower versus initial forecast"
+                    )
+                    evolution_color = PIRELLI_COLORS["Soft"]
+                else:
+                    evolution_text = "On baseline"
+                    evolution_color = "#FFFFFF"
 
             st.markdown(
                 f"""
                 <div style="
-                    padding:14px;
-                    margin-bottom:8px;
+                    padding:16px;
+                    margin-bottom:10px;
                     border:1px solid #555;
                     border-radius:7px;
                 ">
                     <b>Strategy #{index}</b><br>
-                    <b>Total Time:</b>
-                    {format_race_time(total_time)}
+                    <b>Total Time:</b> {format_race_time(total_time)}
                     &nbsp; | &nbsp;
-                    <b>Delta:</b>
-                    +{delta:.3f} sec
+                    <b>Delta to Current Best:</b> +{delta_to_best:.3f} sec
+                    <br><br>
+                    <div style="
+                        font-size:1.15rem;
+                        font-weight:800;
+                        color:{evolution_color};
+                        background:#1A1A1A;
+                        padding:10px;
+                        border-left:5px solid {evolution_color};
+                    ">
+                        Evolution versus Initial Baseline: {evolution_text}
+                    </div>
                     <br>
-                    <b>Strategy Chain:</b>
-                    {chain}
+                    <b>Strategy Chain:</b> {chain}
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-        st.markdown(
-            "### Predictive Telemetry Strategy Charts"
-        )
-
-        for index, strategy in enumerate(
-            strategies,
-            start=1,
-        ):
+        st.markdown("### Predictive Telemetry Strategy Charts")
+        for index, strategy in enumerate(strategies, start=1):
             with st.expander(
                 f"Strategy #{index}",
                 expanded=index == 1,
@@ -2101,6 +2077,18 @@ def _render_sidebar() -> Dict[str, Any]:
         f"Damp {weather_counts['Damp']} | "
         f"Wet {weather_counts['Wet']}"
     )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Aerodynamic Conditions")
+
+    dirty_air = bool(
+        st.sidebar.checkbox(
+            "Dirty Air (Running in Turbulent Wake)",
+            value=bool(st.session_state.get("dirty_air", False)),
+            key="dirty_air_checkbox",
+        )
+    )
+    st.session_state.dirty_air = dirty_air
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Sporting Penalty")
@@ -2237,6 +2225,7 @@ def _render_sidebar() -> Dict[str, Any]:
         "weather_radar": radar,
         "track_temperature": track_temperature,
         "time_penalty": penalty,
+        "dirty_air": dirty_air,
     }
 
 
@@ -2289,6 +2278,8 @@ def main() -> None:
                     config["track_temperature"],
                 time_penalty=
                     config["time_penalty"],
+                dirty_air=
+                    bool(config.get("dirty_air", False)),
             )
 
             if car is None:
@@ -2297,6 +2288,17 @@ def main() -> None:
                 )
                 return
 
+            # Capture the immutable Lap 0 strategy benchmark before any
+            # live lap is simulated.
+            car.race_started = True
+            baseline_optimizer = StrategyOptimizer(car=car, lap_step=3)
+            baseline_strategies = baseline_optimizer.optimize()
+            st.session_state.baseline_initial_time = (
+                float(baseline_strategies[0]["total_time"])
+                if baseline_strategies
+                else None
+            )
+            car.race_started = True
             st.session_state.car = car
 
             _safe_rerun()
@@ -2312,6 +2314,9 @@ def main() -> None:
     )
     car.track_temperature = (
         config["track_temperature"]
+    )
+    car.dirty_air = bool(
+        config.get("dirty_air", False)
     )
 
     if not car.penalty_served:
@@ -2408,7 +2413,7 @@ def main() -> None:
     with control_cols[0]:
 
         if st.button(
-            "BOX, BOX! CONFIRM PIT STOP NEXT LAP",
+            "BOX, BOX",
             use_container_width=True,
         ):
             if selected_set_id is None:
@@ -2465,6 +2470,7 @@ def main() -> None:
         ):
             st.session_state.car = None
             st.session_state.last_message = ""
+            st.session_state.baseline_initial_time = None
             st.session_state.tyre_sets_inventory = (
                 _make_inventory()
             )
