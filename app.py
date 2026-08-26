@@ -111,6 +111,9 @@ TRACKS_DATABASE: Dict[str, TrackSpec] = {
     "Yas Marina": TrackSpec("Yas Marina", 88.0, 22.0, 1.35, 1.40, 58, 22.0),
     "Suzuka": TrackSpec("Suzuka", 92.0, 23.0, 1.45, 1.75, 53, 23.0),
     "Marina Bay": TrackSpec("Marina Bay", 101.0, 23.5, 1.40, 1.65, 61, 23.5),
+    "Shanghai": TrackSpec("Shanghai", 94.5, 23.0, 1.42, 1.60, 56, 23.0),
+    "Miami": TrackSpec("Miami", 91.5, 22.0, 1.38, 1.45, 57, 22.0),
+    "Las Vegas": TrackSpec("Las Vegas", 96.0, 24.0, 1.52, 1.20, 50, 24.0),
     "Generic Sprint": TrackSpec("Generic Sprint", 85.0, 22.0, 1.35, 1.50, 60, 22.0),
 }
 
@@ -343,6 +346,14 @@ class TyrePhysics:
         if self.health < self.CLIFF_THRESHOLD:
             delta += 2.5
 
+        # Hard puncture physics. Once the tyre drops below the break
+        # threshold, the carcass structure starts to fail and the lap
+        # time gets a heavy fixed penalty on top of normal wear loss.
+        if 0.0 < self.health < self.BREAK_THRESHOLD:
+            delta += 15.0
+        elif self.health == 0.0:
+            delta += 30.0
+
         delta += self._temperature_time_delta()
 
         if self.composition in SLICK_COMPOUNDS:
@@ -469,6 +480,8 @@ class CarState:
 
     force_wing_replacement_next_pit: bool = False
     race_started: bool = False
+
+    safety_car_active: bool = False
 
     @property
     def remaining_laps(self) -> int:
@@ -615,7 +628,16 @@ class StrategyOptimizer:
     def _pit_lap_candidates(self) -> List[int]:
         start_lap = max(1, int(self.car.lap))
         finish = int(self.car.track.total_laps)
-        first = start_lap + 1
+
+        # Under Safety Car / VSC conditions an immediate pit stop on the
+        # current lap is a real strategic option (the field is bunched up
+        # and slow, so track position is barely lost), so the current lap
+        # itself becomes a valid pit-lap candidate.
+        if bool(getattr(self.car, "safety_car_active", False)):
+            first = start_lap
+        else:
+            first = start_lap + 1
+
         if first >= finish:
             return []
         return list(range(first, finish, self.lap_step))
@@ -791,7 +813,17 @@ class StrategyOptimizer:
             fitted_compound: Optional[str] = None
 
             if scheduled_stop:
-                lap_time += float(track.pit_loss)
+                # If Safety Car / VSC is active and this plan pits on the
+                # very lap the car is currently on, only that first stop
+                # gets the halved SC pit loss. Every later planned stop on
+                # a future lap still pays the full green-flag pit loss.
+                if (
+                    bool(getattr(self.car, "safety_car_active", False))
+                    and lap == start_lap
+                ):
+                    lap_time += float(track.pit_loss) / 2.0
+                else:
+                    lap_time += float(track.pit_loss)
 
                 if not penalty_served and penalty > 0.0:
                     lap_time += float(penalty)
@@ -875,13 +907,33 @@ class StrategyOptimizer:
         }
 
     def _dry_race_requires_two_slick_sets(self, result: Dict[str, Any]) -> bool:
-        """For fully dry races, only show strategies using two different slick compounds."""
+        """
+        For fully dry races, only show strategies using two different slick
+        compounds across the WHOLE race, not just the remaining segment.
+
+        Pit stops already completed earlier in the race count toward the
+        two-compound rule, so a strategy that already used two compounds
+        does not get forced into another unnecessary stop.
+        """
         for lap in range(1, int(self.car.track.total_laps) + 1):
             if self._weather_at_lap(lap) != "Dry":
                 return False
 
-        compounds = [str(result.get("start_compound", ""))]
+        compounds: List[str] = []
+
+        # Compounds already fitted during real pit stops so far this race.
+        for pit_stop in self.car.pit_stops:
+            compounds.append(str(pit_stop.get("composition", "")))
+
+        # The very first compound the car started the race on.
+        if self.car.laps_history:
+            compounds.append(str(self.car.laps_history[0].get("composition", "")))
+
+        # The compound of the segment being simulated, plus every future
+        # planned stop in this candidate strategy.
+        compounds.append(str(result.get("start_compound", "")))
         compounds.extend(str(compound) for _, compound in result.get("plan", []))
+
         slicks = [compound for compound in compounds if compound in SLICK_COMPOUNDS]
         return len(set(slicks)) >= 2
 
@@ -984,12 +1036,24 @@ def _drive_one_lap(car: CarState) -> str:
     if car.lap == 1:
         lap_time += 3.0
 
+    # Under Safety Car / VSC conditions the whole field is bunched up
+    # behind the pace car, so every lap on track is driven much slower.
+    if car.safety_car_active:
+        lap_time *= 1.4
+
     wing_repair_this_lap = False
     penalty_served_this_lap = False
+    pit_under_safety_car = False
 
     if is_in_lap:
 
-        lap_time += float(car.track.pit_loss)
+        if car.safety_car_active:
+            # Track position is barely lost pitting behind the pace car,
+            # so the net pit loss is cut in half versus a green-flag stop.
+            lap_time += float(car.track.pit_loss) / 2.0
+            pit_under_safety_car = True
+        else:
+            lap_time += float(car.track.pit_loss)
 
         if penalty_outstanding:
 
@@ -1160,6 +1224,12 @@ def _drive_one_lap(car: CarState) -> str:
                 f"{found_comp}."
             )
 
+            if pit_under_safety_car:
+                messages.append(
+                    "Strategic pit stop executed under Safety Car "
+                    "conditions! Net pit loss reduced by 50%."
+                )
+
         else:
             messages.append(
                 "Scheduled tyre set "
@@ -1225,6 +1295,7 @@ def _init_state() -> None:
         "weather_intensity": "Wet",
         "baseline_initial_time": None,
         "dirty_air": False,
+        "safety_car_active": False,
     }
 
     for key, value in defaults.items():
@@ -1920,7 +1991,7 @@ class Dashboard:
     def render_strategy_cards(car: CarState) -> None:
         st.markdown("### Global Strategy Brute-Force: TOP-5 Permutations")
 
-        strategies = StrategyOptimizer(car=car, lap_step=5).optimize()
+        strategies = StrategyOptimizer(car=car, lap_step=7).optimize()
 
         if not strategies:
             st.warning("No legal strategies were found.")
@@ -2319,6 +2390,10 @@ def main() -> None:
         config.get("dirty_air", False)
     )
 
+    car.safety_car_active = bool(
+        st.session_state.get("safety_car_active", False)
+    )
+
     if not car.penalty_served:
         car.time_penalty = float(
             st.session_state.time_penalty
@@ -2369,6 +2444,34 @@ def main() -> None:
     st.session_state.force_wing_next_pit = (
         force_wing_next_pit
     )
+
+    st.markdown(
+        "### Pit Wall Command Center"
+    )
+
+    safety_car_active = st.checkbox(
+        "SAFETY CAR / VSC PERIOD ACTIVE",
+        value=bool(
+            st.session_state.get(
+                "safety_car_active",
+                False,
+            )
+        ),
+        key="safety_car_toggle",
+        help=(
+            "While active, every lap on track is 40% slower and any "
+            "pit stop taken this lap has its net pit loss cut in half."
+        ),
+    )
+
+    st.session_state.safety_car_active = safety_car_active
+    car.safety_car_active = safety_car_active
+
+    if safety_car_active:
+        st.warning(
+            "Safety Car / VSC period is ACTIVE: lap times are down "
+            "40% and the current pit loss is halved."
+        )
 
     st.markdown(
         "### Pit Stop Planning"
