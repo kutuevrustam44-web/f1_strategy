@@ -1294,6 +1294,7 @@ def _init_state() -> None:
         "weather_duration_laps": 0,
         "weather_intensity": "Wet",
         "baseline_initial_time": None,
+        "baseline_initial_strategy": None,
         "dirty_air": False,
         "safety_car_active": False,
     }
@@ -1998,10 +1999,15 @@ class Dashboard:
             return
 
         baseline = st.session_state.get("baseline_initial_time")
-        best_time = float(strategies[0]["total_time"])
+
+        # The optimizer projects only the remaining race from the current lap.
+        # Add the already completed race time so the displayed Total Time is
+        # always the projected time for the entire race.
+        best_time = float(car.total_time) + float(strategies[0]["total_time"])
 
         for index, strategy in enumerate(strategies, start=1):
-            total_time = float(strategy["total_time"])
+            remaining_time = float(strategy["total_time"])
+            total_time = float(car.total_time) + remaining_time
             delta_to_best = total_time - best_time
             chain = Dashboard.format_strategy_chain(
                 strategy,
@@ -2018,9 +2024,7 @@ class Dashboard:
                 evolution_text = "Baseline pending"
                 evolution_color = "#FFFFFF"
             else:
-                evolution = (
-                    float(car.total_time) + total_time
-                ) - float(baseline)
+                evolution = total_time - float(baseline)
 
                 if evolution < -0.0005:
                     evolution_text = (
@@ -2063,6 +2067,36 @@ class Dashboard:
                     </div>
                     <br>
                     <b>Strategy Chain:</b> {chain}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        initial_strategy = st.session_state.get(
+            "baseline_initial_strategy"
+        )
+        if initial_strategy is not None:
+            initial_chain = Dashboard.format_strategy_chain(
+                initial_strategy,
+                car.track.total_laps,
+            )
+            initial_time = float(
+                initial_strategy["total_time"]
+            )
+            st.markdown(
+                f"""
+                <div style="
+                    padding:16px;
+                    margin-top:10px;
+                    margin-bottom:10px;
+                    border:2px solid #FFFFFF;
+                    border-radius:7px;
+                ">
+                    <b>Initial Algorithm Recommendation</b><br>
+                    <b>Predicted Race Time:</b>
+                    {format_race_time(initial_time)}
+                    <br><br>
+                    <b>Strategy Chain:</b> {initial_chain}
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -2366,6 +2400,11 @@ def main() -> None:
             baseline_strategies = baseline_optimizer.optimize()
             st.session_state.baseline_initial_time = (
                 float(baseline_strategies[0]["total_time"])
+                if baseline_strategies
+                else None
+            )
+            st.session_state.baseline_initial_strategy = (
+                copy.deepcopy(baseline_strategies[0])
                 if baseline_strategies
                 else None
             )
